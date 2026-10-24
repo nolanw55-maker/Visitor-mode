@@ -231,6 +231,10 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
         </div>
       </div>
       <p class="sc-hint" id="sc-hint"></p>
+      <div class="sc-offline" id="sc-offline" hidden>
+        <div class="controls" id="offline-btns"></div>
+        <p class="sc-hint" id="offline-msg"></p>
+      </div>
       <p class="sc-credit">Road data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a></p>
     </div>
     <div class="triplog">
@@ -1188,8 +1192,132 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
     if (has(function (e) { return e && e.name === "AbortError"; })) return online ? "map servers slow; your internet is working" : "map servers too slow, or a weak signal";
     return online ? "map servers unreachable; your internet is working" : "no internet, or map servers unreachable";
   }
+  /* ---------- stored road maps ----------
+     A GitHub job (.github/workflows/roads.yml in the site's repository) saves an area's roads as small
+     tiles next to this page. Inside such an area the app reads those tiles instead of the public map
+     servers, keeps every tile it downloads on the phone, and "Save map" fetches the whole area on wifi
+     so the side check then needs no signal at all. */
+  var PACK_CACHE = "vm-roads-v1";
+  var pack = { index: null, base: null, tiles: {}, loading: {}, failed: {}, order: [], key: null, dirty: false };
+  function packBases() {
+    var bases = [""], m = location.hostname.match(/^([^.]+)\.github\.io$/i), repo = location.pathname.split("/")[1];
+    if (m && repo) bases.push("https://raw.githubusercontent.com/" + m[1] + "/" + repo + "/main/");
+    return bases;
+  }
+  function packCache() { return typeof caches !== "undefined" ? caches.open(PACK_CACHE).catch(function () { return null; }) : Promise.resolve(null); }
+  function netJSON(path, opts, store) {
+    var bases = packBases();
+    if (pack.base != null) bases = [pack.base].concat(bases.filter(function (b) { return b !== pack.base; }));
+    return (function tryBase(i) {
+      if (i >= bases.length) return Promise.reject(new Error("unavailable"));
+      return fetch(bases[i] + path, opts || {}).then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        pack.base = bases[i];
+        if (store) { var copy = r.clone(); packCache().then(function (c) { if (c) c.put(path, copy).catch(function () {}); }); }
+        return r.json();
+      }).catch(function () { return tryBase(i + 1); });
+    })(0);
+  }
+  function tileJSON(path) {   // saved copy first: works with no signal
+    return packCache().then(function (c) { return c ? c.match(path) : null; }).catch(function () { return null; })
+      .then(function (hit) { return hit ? hit.json() : netJSON(path, {}, true); });
+  }
+  function loadPackIndex() {
+    if (!/^https?:$/.test(location.protocol)) return;
+    netJSON("roads/index.json", { cache: "no-cache" }, true)
+      .catch(function () { return packCache().then(function (c) { return c ? c.match("roads/index.json") : null; }).then(function (h) { return h ? h.json() : null; }); })
+      .then(function (j) { if (j && j.areas) { pack.index = j; renderOffline(); } }).catch(function () {});
+  }
+  function decodePackWay(w) {
+    var g = w.g, pts = [], lat = 0, lon = 0;
+    for (var i = 0; i + 1 < g.length; i += 2) { lat += g[i]; lon += g[i + 1]; pts.push({ lat: lat / 1e6, lon: lon / 1e6 }); }
+    return { type: "way", id: w.id, tags: w.t || {}, geometry: pts };
+  }
+  function packAreaAt(fix) {
+    var idx = pack.index; if (!idx || !idx.areas) return null;
+    for (var name in idx.areas) {
+      var a = idx.areas[name], b = a.bbox;
+      if (fix.lat >= b[0] && fix.lat <= b[2] && fix.lon >= b[1] && fix.lon <= b[3]) {
+        if (!a._set) { a._set = {}; a.tiles.forEach(function (k) { a._set[k] = 1; }); }
+        return { name: name, area: a };
+      }
+    }
+    return null;
+  }
+  function loadTile(name, key) {
+    var id = name + "/" + key;
+    pack.loading[id] = true;
+    tileJSON("roads/" + id + ".json").then(function (j) {
+      pack.tiles[id] = VM.parseWays({ elements: (j.ways || []).map(decodePackWay) });
+      pack.order.push(id); delete pack.loading[id]; delete pack.failed[id]; pack.dirty = true;
+      if (pack.order.length > 60) { var old = pack.order.shift(); if (old !== id) delete pack.tiles[old]; }
+    }, function () {
+      delete pack.loading[id]; pack.failed[id] = Date.now();
+      if (!roads.ways.length) { roads.error = "weak or no mobile signal, and this part of the map isn't saved on the phone yet"; renderSide(); }
+    });
+  }
+  /* Returns true when a stored map covers this spot (then the public map servers aren't used). */
+  function packRoads(fix) {
+    var hit = packAreaAt(fix); if (!hit) return false;
+    var size = pack.index.tile, ty = Math.floor(fix.lat / size), tx = Math.floor(fix.lon / size), need = [];
+    for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) {
+      var k = (ty + dy) + "_" + (tx + dx);
+      if (hit.area._set[k]) need.push(hit.name + "/" + k);
+    }
+    need.forEach(function (id) {
+      if (!pack.tiles[id] && !pack.loading[id] && !(pack.failed[id] && Date.now() - pack.failed[id] < 10000)) loadTile(hit.name, id.split("/")[1]);
+    });
+    var key = ty + "_" + tx;
+    if (key !== pack.key || pack.dirty) {
+      pack.key = key; pack.dirty = false;
+      var byId = {};
+      need.forEach(function (id) { (pack.tiles[id] || []).forEach(function (w) { byId[w.id] = w; }); });
+      roads.ways = Object.keys(byId).map(function (k2) { return byId[k2]; });
+      roads.center = { lat: fix.lat, lon: fix.lon }; roads.lastRadius = 0;
+      if (roads.ways.length) roads.error = null;
+      renderSide(); if (mode === "live") drawMap();
+    }
+    return true;
+  }
+  function areaLabel(name) { return name.replace(/-/g, " ").replace(/\b\w/g, function (c) { return c.toUpperCase(); }); }
+  function renderOffline() {
+    var box = $("sc-offline"), btns = $("offline-btns"), idx = pack.index;
+    if (!idx || !idx.areas || !Object.keys(idx.areas).length) { box.hidden = true; return; }
+    box.hidden = false; btns.textContent = "";
+    Object.keys(idx.areas).forEach(function (name) {
+      var a = idx.areas[name], b = document.createElement("button");
+      b.className = "btn"; b.type = "button";
+      b.textContent = "Save " + areaLabel(name) + " map" + (a.bytes ? " (" + Math.max(1, Math.round(a.bytes / 1e6)) + " MB)" : "");
+      b.addEventListener("click", function () { saveArea(name, b); });
+      btns.appendChild(b);
+      packCache().then(function (c) { return c ? c.keys() : []; }).then(function (keys) {
+        var pre = "/roads/" + name + "/", have = keys.filter(function (r) { return r.url.indexOf(pre) >= 0; }).length;
+        if (have >= a.tiles.length) { b.textContent = areaLabel(name) + " map saved ✓ (tap to refresh)"; }
+      }).catch(function () {});
+    });
+    $("offline-msg").textContent = "Save the map once on wifi. After that the side check works without signal, as long as this page stays open.";
+  }
+  function saveArea(name, btn) {
+    var a = pack.index.areas[name], list = a.tiles.slice(), done = 0, failed = 0, total = list.length;
+    btn.disabled = true;
+    if (navigator.storage && navigator.storage.persist) { try { navigator.storage.persist(); } catch (e) {} }
+    function next() {
+      var k = list.shift(); if (k == null) return Promise.resolve();
+      return netJSON("roads/" + name + "/" + k + ".json", {}, true).then(function () { done++; }, function () { failed++; })
+        .then(function () { $("offline-msg").textContent = "Saving " + areaLabel(name) + " map: " + (done + failed) + " of " + total + "…"; return next(); });
+    }
+    Promise.all([next(), next(), next(), next(), next(), next()]).then(function () {
+      btn.disabled = false; pack.failed = {}; pack.dirty = true;
+      $("offline-msg").textContent = failed
+        ? "Saved " + done + " of " + total + " map pieces. The signal dropped: tap Save again on wifi to finish."
+        : areaLabel(name) + " map saved on this phone. The side check now works without signal while this page is open.";
+      if (!failed) btn.textContent = areaLabel(name) + " map saved ✓ (tap to refresh)";
+    });
+  }
   function maybeFetchRoads(fix) {
-    if (!sideOn || roads.loading) return;
+    if (!sideOn) return;
+    if (packRoads(fix)) return;
+    if (roads.loading) return;
     // Refetch well before reaching the edge of the patch we have, so a patchy signal has a cushion.
     var refetchM = Math.max(150, roads.lastRadius - 700);
     var due = !roads.center || VM.haversine(roads.center, fix) > refetchM;
@@ -1287,7 +1415,7 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
     if (!sideOn) return msg("Side check is off.");
     if (live.watchId == null && !live.track.length) return msg("Starts with a live drive.", "Matches your GPS position to the nearest mapped road. On one-way streets and dual carriageways it checks your direction; on two-way roads it shows which side of the centre line the GPS puts you.");
     if (!roads.ways.length) return msg(roads.error ? "Couldn't load map data (" + roads.error + "). Trying again every 10 seconds. Spoken reminders still work." : "Loading map data…");
-    if (!r || r.status === "no-road") return msg("No mapped road here.", "Nothing within 25 m that matches your direction of travel.");
+    if (!r || r.status === "no-road") return msg("No mapped road here.", "Nothing within 30 m that matches your direction of travel.");
     road.textContent = r.road + " · " + (r.oneway ? "one-way" + (r.bikeBothWays ? " (bikes allowed both ways)" : "") : "two-way");
     if (r.oneway) {
       dot.hidden = true; gauge.hidden = true;
@@ -1332,6 +1460,7 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
   });
   function liveStart() {
     unlockAudio();
+    loadPackIndex();
     if (!("geolocation" in navigator)) { liveMsg("This browser doesn't offer location, so live mode can't run here.", true); return; }
     live.engine = VM.createEngine({ nightIntervalMs: Number(settings.night) * 60000 });
     live.track = []; live.origin = null; live.entries = []; live.markers = []; live.count = 0; live.acc = null;
@@ -1397,6 +1526,7 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
   }
 
   /* ---------- wiring ---------- */
+  loadPackIndex();
   function setMode(m) {
     mode = m;
     $("tab-demo").setAttribute("aria-selected", String(m === "demo"));
