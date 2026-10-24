@@ -241,7 +241,7 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
       </div>
       <p class="note" id="tl-msg">Records every GPS reading, the road it matched and the side-check numbers, so the settings can be tuned on real data. It stays on your phone unless you share or download it, and it includes your route. Starting a new drive clears it.</p>
     </div>
-    <p class="note">Needs location permission, and the page has to be opened from a secure web address (https).</p>
+    <p class="note">Uses your phone's location. The phone asks for permission the first time you tap Start.</p>
   </section>
 
   <figure class="map">
@@ -1128,8 +1128,19 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
   };
   function newSideMonitor() { return VM.createSideMonitor(VM.SIDE_PRESETS[settings.sens] || VM.SIDE_PRESETS.medium); }
   var sideOn = true, sideMon = newSideMonitor();
-  var OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"];
-  var ROAD_RADIUS_M = 1200, ROAD_REFETCH_M = 500, ROAD_KEEP_M = 3000;
+  // Several public map servers: if one is busy, down or blocked, the next is tried.
+  var OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter"];
+  var ROAD_RADIUS_M = 1200, ROAD_SMALL_RADIUS_M = 500, ROAD_REFETCH_M = 500, ROAD_KEEP_M = 3000, ROAD_TIMEOUT_MS = 20000;
+  roads.radius = ROAD_RADIUS_M;
+  function roadError(e) {
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return "no internet connection";
+    if (e && e.name === "AbortError") return "map server too slow";
+    if (e && e.status === 429) return "map server busy";
+    if (e && e.status >= 500) return "map server unavailable";
+    if (e && e.status) return "map server said " + e.status;
+    return "no internet connection, or map server unreachable";
+  }
   function maybeFetchRoads(fix) {
     if (!sideOn || roads.loading) return;
     // Fetch a wide patch and refetch early, so a patchy mobile signal has a cushion:
@@ -1137,27 +1148,34 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
     var due = !roads.center || VM.haversine(roads.center, fix) > ROAD_REFETCH_M;
     if (!due || Date.now() - roads.lastFetchAt < (roads.error ? 10000 : 15000)) return;
     roads.loading = true; roads.lastFetchAt = Date.now();
-    var q = "[out:json][timeout:25];way(around:" + ROAD_RADIUS_M + "," + fix.lat.toFixed(6) + "," + fix.lon.toFixed(6) + ")[highway~\"" + VM.HIGHWAY_QUERY + "\"];out tags geom;";
+    var q = "[out:json][timeout:20];way(around:" + roads.radius + "," + fix.lat.toFixed(6) + "," + fix.lon.toFixed(6) + ")[highway~\"" + VM.HIGHWAY_QUERY + "\"];out tags geom;";
+    var lastErr = null;
     (function attempt(i) {
-      console.log("Fetching roads from", OVERPASS[i], "for", fix.lat.toFixed(4), fix.lon.toFixed(4));
-      fetch(OVERPASS[i], { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "data=" + encodeURIComponent(q) })
-        .then(function (r) { if (!r.ok) throw new Error("map server said " + r.status); return r.json(); })
+      var ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      var timer = ctl ? setTimeout(function () { ctl.abort(); }, ROAD_TIMEOUT_MS) : null;
+      fetch(OVERPASS[i], { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "data=" + encodeURIComponent(q), signal: ctl ? ctl.signal : undefined })
+        .then(function (r) { if (!r.ok) { var er = new Error("HTTP " + r.status); er.status = r.status; throw er; } return r.json(); })
         .then(function (j) {
-          console.log("Got", j.elements ? j.elements.length : 0, "elements from Overpass. Parsing...");
+          if (timer) clearTimeout(timer);
           var byId = {};
           roads.ways.forEach(function (w) {
             for (var p = 0; p < w.pts.length; p++) if (VM.haversine(w.pts[p], fix) < ROAD_KEEP_M) { byId[w.id] = w; break; }
           });
           VM.parseWays(j).forEach(function (w) { byId[w.id] = w; });
           roads.ways = Object.keys(byId).map(function (k) { return byId[k]; });
-          console.log("Parsed", roads.ways.length, "roads:", roads.ways.map(function(w) { return w.name + " (oneway=" + w.oneway + ")"; }).join(", "));
           roads.center = { lat: fix.lat, lon: fix.lon }; roads.error = null; roads.loading = false;
+          roads.radius = ROAD_RADIUS_M;
           renderSide(); if (mode === "live") drawMap();
         })
         .catch(function (e) {
-          console.error("Roads fetch error:", e && e.message);
+          if (timer) clearTimeout(timer);
+          lastErr = e;
+          console.error("Roads fetch error from", OVERPASS[i], e && (e.status || e.name || e.message));
           if (i + 1 < OVERPASS.length) { attempt(i + 1); return; }
-          roads.error = (e && e.message) || "network error"; roads.loading = false; renderSide();
+          // Every server failed: ask for a smaller patch next time (lighter for a busy server or a weak signal).
+          roads.radius = ROAD_SMALL_RADIUS_M;
+          roads.error = roadError(lastErr); roads.loading = false; renderSide();
         });
     })(0);
   }
@@ -1233,7 +1251,7 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
     function msg(a, b) { road.textContent = a; read.textContent = b || ""; dot.hidden = true; }
     if (!sideOn) return msg("Side check is off.");
     if (live.watchId == null && !live.track.length) return msg("Starts with a live drive.", "Matches your GPS position to the nearest mapped road. On one-way streets and dual carriageways it checks your direction; on two-way roads it shows which side of the centre line the GPS puts you.");
-    if (!roads.ways.length) return msg(roads.error ? "Couldn't load map data: " + roads.error + ". Trying again shortly." : "Loading map data…");
+    if (!roads.ways.length) return msg(roads.error ? "Couldn't load map data (" + roads.error + "). Trying again every 10 seconds. Spoken reminders still work." : "Loading map data…");
     if (!r || r.status === "no-road") return msg("No mapped road here.", "Nothing within 25 m that matches your direction of travel.");
     road.textContent = r.road + " · " + (r.oneway ? "one-way" + (r.bikeBothWays ? " (bikes allowed both ways)" : "") : "two-way");
     if (r.oneway) {
