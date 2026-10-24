@@ -749,7 +749,7 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
   var VM = window.VM;
   var $ = function (id) { return document.getElementById(id); };
   var DEMO_START = Date.UTC(2026, 9, 14, 20, 40, 0);
-  var settings = { local: "Jersey", home: "France", voice: "auto", night: 4, sens: "medium" };
+  var settings = { local: "Jersey", home: "France", voice: "auto", night: 4, sens: "medium", mode: "demo" };
   try {
     var saved = JSON.parse(localStorage.getItem("vm-settings") || "null");
     if (saved) for (var k in settings) if (saved[k] != null) settings[k] = saved[k];
@@ -1259,6 +1259,11 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
   /* Returns true when a stored map covers this spot (then the public map servers aren't used). */
   function packRoads(fix) {
     var hit = packAreaAt(fix); if (!hit) return false;
+    pack.autoSaved = pack.autoSaved || {};
+    if (!pack.autoSaved[hit.name]) {
+      pack.autoSaved[hit.name] = true;
+      saveArea(hit.name, document.querySelector('#offline-btns [data-area="' + hit.name + '"]'), true);
+    }
     var size = pack.index.tile, ty = Math.floor(fix.lat / size), tx = Math.floor(fix.lon / size), need = [];
     for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) {
       var k = (ty + dy) + "_" + (tx + dx);
@@ -1286,7 +1291,7 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
     box.hidden = false; btns.textContent = "";
     Object.keys(idx.areas).forEach(function (name) {
       var a = idx.areas[name], b = document.createElement("button");
-      b.className = "btn"; b.type = "button";
+      b.className = "btn"; b.type = "button"; b.setAttribute("data-area", name);
       b.textContent = "Save " + areaLabel(name) + " map" + (a.bytes ? " (" + Math.max(1, Math.round(a.bytes / 1e6)) + " MB)" : "");
       b.addEventListener("click", function () { saveArea(name, b); });
       btns.appendChild(b);
@@ -1297,21 +1302,31 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
     });
     $("offline-msg").textContent = "Save the map once on wifi. After that the side check works without signal, as long as this page stays open.";
   }
-  function saveArea(name, btn) {
+  function saveArea(name, btn, onlyMissing) {
     var a = pack.index.areas[name], list = a.tiles.slice(), done = 0, failed = 0, total = list.length;
+    btn = btn || {};
+    if (pack.saving) return; pack.saving = true;
     btn.disabled = true;
+    var ready = onlyMissing
+      ? packCache().then(function (c) { return c ? c.keys() : []; }).then(function (keys) {
+          var have = {}; keys.forEach(function (r) { have[r.url.split("/roads/" + name + "/")[1]] = 1; });
+          list = list.filter(function (k) { return !have[k + ".json"]; }); done = total - list.length;
+        }).catch(function () {})
+      : Promise.resolve();
     if (navigator.storage && navigator.storage.persist) { try { navigator.storage.persist(); } catch (e) {} }
     function next() {
       var k = list.shift(); if (k == null) return Promise.resolve();
       return netJSON("roads/" + name + "/" + k + ".json", {}, true).then(function () { done++; }, function () { failed++; })
         .then(function () { $("offline-msg").textContent = "Saving " + areaLabel(name) + " map: " + (done + failed) + " of " + total + "…"; return next(); });
     }
-    Promise.all([next(), next(), next(), next(), next(), next()]).then(function () {
-      btn.disabled = false; pack.failed = {}; pack.dirty = true;
+    ready.then(function () { return Promise.all([next(), next(), next(), next(), next(), next()]); }).then(function () {
+      btn.disabled = false; pack.failed = {}; pack.dirty = true; pack.saving = false;
       $("offline-msg").textContent = failed
         ? "Saved " + done + " of " + total + " map pieces. The signal dropped: tap Save again on wifi to finish."
         : areaLabel(name) + " map saved on this phone. The side check now works without signal while this page is open.";
-      if (!failed) btn.textContent = areaLabel(name) + " map saved ✓ (tap to refresh)";
+      var msg = $("offline-msg").textContent; renderOffline(); $("offline-msg").textContent = msg;
+      var nb = document.querySelector('#offline-btns [data-area="' + name + '"]');
+      if (nb && !failed) nb.textContent = areaLabel(name) + " map saved ✓ (tap to refresh)";
     });
   }
   function maybeFetchRoads(fix) {
@@ -1528,7 +1543,7 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
   /* ---------- wiring ---------- */
   loadPackIndex();
   function setMode(m) {
-    mode = m;
+    mode = m; settings.mode = m; save();
     $("tab-demo").setAttribute("aria-selected", String(m === "demo"));
     $("tab-live").setAttribute("aria-selected", String(m === "live"));
     $("panel-demo").hidden = m !== "demo";
@@ -1604,6 +1619,7 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
   renderSens();
   renderSide();
   renderLogCount();
+  if (settings.mode === "live") setMode("live");
   window.addEventListener("resize", drawMap);
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(drawMap);
 })();
