@@ -1131,53 +1131,88 @@ footer { color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--li
   // Several public map servers: if one is busy, down or blocked, the next is tried.
   var OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter"];
-  var ROAD_RADIUS_M = 1200, ROAD_SMALL_RADIUS_M = 500, ROAD_REFETCH_M = 500, ROAD_KEEP_M = 3000, ROAD_TIMEOUT_MS = 20000;
-  roads.radius = ROAD_RADIUS_M;
-  function roadError(e) {
-    if (typeof navigator !== "undefined" && navigator.onLine === false) return "no internet connection";
-    if (e && e.name === "AbortError") return "map server too slow";
-    if (e && e.status === 429) return "map server busy";
-    if (e && e.status >= 500) return "map server unavailable";
-    if (e && e.status) return "map server said " + e.status;
-    return "no internet connection, or map server unreachable";
+  // Start with a small patch (quick to fetch), then widen once a fetch succeeds; shrink again after a failure.
+  var ROAD_RADIUS_M = 1200, ROAD_FIRST_RADIUS_M = 600, ROAD_SMALL_RADIUS_M = 400, ROAD_KEEP_M = 3000;
+  var ROAD_TIMEOUT_MS = 45000, ROAD_HEDGE_MS = 8000;
+  roads.radius = ROAD_FIRST_RADIUS_M; roads.lastRadius = 0;
+  function fetchRoadsFrom(url, q, signal) {
+    return fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "data=" + encodeURIComponent(q), signal: signal })
+      .then(function (r) { if (!r.ok) { var er = new Error("HTTP " + r.status); er.status = r.status; throw er; } return r.json(); });
+  }
+  /* Ask the first map server; if it hasn't answered within a few seconds (or fails), ask the next one too.
+     The first good answer wins and the others are cancelled. */
+  function hedgedRoads(q) {
+    return new Promise(function (resolve, reject) {
+      var ctls = [], done = false, pending = 0, started = 0, errors = [], hedgeTimer = null, killTimer = null;
+      function finish(ok, val) {
+        if (done) return; done = true; clearTimeout(hedgeTimer); clearTimeout(killTimer);
+        ctls.forEach(function (c) { try { if (c) c.abort(); } catch (e) {} });
+        if (ok) resolve(val); else reject(val);
+      }
+      function scheduleHedge() {
+        clearTimeout(hedgeTimer);
+        if (started < OVERPASS.length) hedgeTimer = setTimeout(function () { start(); scheduleHedge(); }, ROAD_HEDGE_MS);
+      }
+      function start() {
+        if (done || started >= OVERPASS.length) return;
+        var i = started++, ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+        ctls.push(ctl); pending++;
+        fetchRoadsFrom(OVERPASS[i], q, ctl ? ctl.signal : undefined).then(function (j) { finish(true, j); }, function (e) {
+          pending--; errors.push(e);
+          console.error("Roads fetch error from", OVERPASS[i], e && (e.status || e.name || e.message));
+          if (done) return;
+          if (started < OVERPASS.length) { start(); scheduleHedge(); }
+          else if (pending === 0) finish(false, errors);
+        });
+      }
+      killTimer = setTimeout(function () { var t = new Error("timeout"); t.name = "AbortError"; finish(false, errors.concat([t])); }, ROAD_TIMEOUT_MS);
+      start(); scheduleHedge();
+    });
+  }
+  /* Is the internet working at all? A tiny request back to this page's own site tells "no signal" from "map servers slow". */
+  function probeInternet() {
+    if (!/^https?:$/.test(location.protocol)) return Promise.resolve(null);
+    var ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    var t = ctl ? setTimeout(function () { ctl.abort(); }, 8000) : null;
+    var url = location.href.split("#")[0]; url += (url.indexOf("?") < 0 ? "?" : "&") + "ping=" + Date.now();
+    return fetch(url, { method: "HEAD", cache: "no-store", signal: ctl ? ctl.signal : undefined })
+      .then(function () { if (t) clearTimeout(t); return true; }, function () { if (t) clearTimeout(t); return false; });
+  }
+  function roadError(errors, online) {
+    errors = errors || [];
+    var has = function (f) { return errors.some(f); };
+    if (online === false || (typeof navigator !== "undefined" && navigator.onLine === false)) return "weak or no mobile signal";
+    if (has(function (e) { return e && e.status === 429; })) return "map servers busy";
+    if (has(function (e) { return e && e.status >= 500; })) return "map servers unavailable";
+    if (has(function (e) { return e && e.name === "AbortError"; })) return online ? "map servers slow; your internet is working" : "map servers too slow, or a weak signal";
+    return online ? "map servers unreachable; your internet is working" : "no internet, or map servers unreachable";
   }
   function maybeFetchRoads(fix) {
     if (!sideOn || roads.loading) return;
-    // Fetch a wide patch and refetch early, so a patchy mobile signal has a cushion:
-    // roads stay ahead of you for ~700 m after the signal drops. Old roads are kept nearby.
-    var due = !roads.center || VM.haversine(roads.center, fix) > ROAD_REFETCH_M;
+    // Refetch well before reaching the edge of the patch we have, so a patchy signal has a cushion.
+    var refetchM = Math.max(150, roads.lastRadius - 700);
+    var due = !roads.center || VM.haversine(roads.center, fix) > refetchM;
     if (!due || Date.now() - roads.lastFetchAt < (roads.error ? 10000 : 15000)) return;
     roads.loading = true; roads.lastFetchAt = Date.now();
-    var q = "[out:json][timeout:20];way(around:" + roads.radius + "," + fix.lat.toFixed(6) + "," + fix.lon.toFixed(6) + ")[highway~\"" + VM.HIGHWAY_QUERY + "\"];out tags geom;";
-    var lastErr = null;
-    (function attempt(i) {
-      var ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
-      var timer = ctl ? setTimeout(function () { ctl.abort(); }, ROAD_TIMEOUT_MS) : null;
-      fetch(OVERPASS[i], { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: "data=" + encodeURIComponent(q), signal: ctl ? ctl.signal : undefined })
-        .then(function (r) { if (!r.ok) { var er = new Error("HTTP " + r.status); er.status = r.status; throw er; } return r.json(); })
-        .then(function (j) {
-          if (timer) clearTimeout(timer);
-          var byId = {};
-          roads.ways.forEach(function (w) {
-            for (var p = 0; p < w.pts.length; p++) if (VM.haversine(w.pts[p], fix) < ROAD_KEEP_M) { byId[w.id] = w; break; }
-          });
-          VM.parseWays(j).forEach(function (w) { byId[w.id] = w; });
-          roads.ways = Object.keys(byId).map(function (k) { return byId[k]; });
-          roads.center = { lat: fix.lat, lon: fix.lon }; roads.error = null; roads.loading = false;
-          roads.radius = ROAD_RADIUS_M;
-          renderSide(); if (mode === "live") drawMap();
-        })
-        .catch(function (e) {
-          if (timer) clearTimeout(timer);
-          lastErr = e;
-          console.error("Roads fetch error from", OVERPASS[i], e && (e.status || e.name || e.message));
-          if (i + 1 < OVERPASS.length) { attempt(i + 1); return; }
-          // Every server failed: ask for a smaller patch next time (lighter for a busy server or a weak signal).
-          roads.radius = ROAD_SMALL_RADIUS_M;
-          roads.error = roadError(lastErr); roads.loading = false; renderSide();
-        });
-    })(0);
+    var radius = roads.radius;
+    var q = "[out:json][timeout:25];way(around:" + radius + "," + fix.lat.toFixed(6) + "," + fix.lon.toFixed(6) + ")[highway~\"" + VM.HIGHWAY_QUERY + "\"];out tags geom;";
+    hedgedRoads(q).then(function (j) {
+      var byId = {};
+      roads.ways.forEach(function (w) {
+        for (var p = 0; p < w.pts.length; p++) if (VM.haversine(w.pts[p], fix) < ROAD_KEEP_M) { byId[w.id] = w; break; }
+      });
+      VM.parseWays(j).forEach(function (w) { byId[w.id] = w; });
+      roads.ways = Object.keys(byId).map(function (k) { return byId[k]; });
+      roads.center = { lat: fix.lat, lon: fix.lon }; roads.lastRadius = radius; roads.error = null; roads.loading = false;
+      roads.radius = ROAD_RADIUS_M;
+      renderSide(); if (mode === "live") drawMap();
+    }, function (errors) {
+      roads.radius = ROAD_SMALL_RADIUS_M;
+      probeInternet().then(function (online) {
+        roads.error = roadError(errors, online); roads.loading = false; roads.lastFetchAt = Date.now(); renderSide();
+      });
+    });
   }
   /* ---------- trip log ---------- */
   var tripLog = [];
