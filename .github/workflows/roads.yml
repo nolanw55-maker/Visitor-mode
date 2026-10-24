@@ -1,0 +1,94 @@
+name: Download road map
+on:
+  workflow_dispatch:
+    inputs:
+      area:
+        description: "Area name"
+        default: "mallorca"
+      bbox:
+        description: "south,west,north,east"
+        default: "39.25,2.30,39.97,3.50"
+permissions:
+  contents: write
+jobs:
+  roads:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download roads and save them as map tiles
+        env:
+          AREA: ${{ inputs.area }}
+          BBOX: ${{ inputs.bbox }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time, math, glob, urllib.request, urllib.parse
+          area = os.environ["AREA"].strip().lower().replace(" ", "-")
+          s, w, n, e = [float(x) for x in os.environ["BBOX"].split(",")]
+          TILE, CHUNK = 0.02, 0.25
+          HW = "^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|road|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"
+          KEEP = {"highway", "name", "ref", "oneway", "junction", "area", "oneway:bicycle", "cycleway", "cycleway:left", "cycleway:right"}
+          SERVERS = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
+          def fetch(bb):
+              if os.environ.get("TEST_INPUT"):
+                  return json.load(open(os.environ["TEST_INPUT"]))["elements"]
+              q = '[out:json][timeout:600];way(%f,%f,%f,%f)[highway~"%s"];out tags geom;' % (bb + (HW,))
+              data = urllib.parse.urlencode({"data": q}).encode()
+              for attempt in range(5):
+                  for url in SERVERS:
+                      try:
+                          req = urllib.request.Request(url, data=data, headers={"User-Agent": "VisitorMode road map job"})
+                          with urllib.request.urlopen(req, timeout=700) as r:
+                              return json.load(r)["elements"]
+                      except Exception as ex:
+                          print("  retrying:", url, ex, flush=True)
+                          time.sleep(20)
+              sys.exit("The map servers kept failing. Run the job again later.")
+          ways, lat = {}, s
+          while lat < n:
+              lon = w
+              while lon < e:
+                  bb = (lat, lon, min(lat + CHUNK, n), min(lon + CHUNK, e))
+                  print("Downloading", bb, flush=True)
+                  for el in fetch(bb):
+                      if el.get("type") == "way" and len(el.get("geometry") or []) >= 2:
+                          ways[el["id"]] = el
+                  time.sleep(0 if os.environ.get("TEST_INPUT") else 3)
+                  lon += CHUNK
+              lat += CHUNK
+          tiles = {}
+          for el in ways.values():
+              g, plat, plon = [], 0, 0
+              for p in el["geometry"]:
+                  a, b = round(p["lat"] * 1e6), round(p["lon"] * 1e6)
+                  g += [a - plat, b - plon]
+                  plat, plon = a, b
+              rec = {"id": el["id"], "t": {k: v for k, v in (el.get("tags") or {}).items() if k in KEEP}, "g": g}
+              for k in {"%d_%d" % (math.floor(p["lat"] / TILE), math.floor(p["lon"] / TILE)) for p in el["geometry"]}:
+                  tiles.setdefault(k, []).append(rec)
+          out = os.path.join("roads", area)
+          os.makedirs(out, exist_ok=True)
+          for f in glob.glob(os.path.join(out, "*.json")):
+              os.remove(f)
+          size = 0
+          for k, recs in tiles.items():
+              path = os.path.join(out, k + ".json")
+              with open(path, "w") as f:
+                  json.dump({"ways": recs}, f, separators=(",", ":"))
+              size += os.path.getsize(path)
+          ip = os.path.join("roads", "index.json")
+          idx = json.load(open(ip)) if os.path.exists(ip) else {}
+          idx["tile"] = TILE
+          idx.setdefault("areas", {})[area] = {"bbox": [s, w, n, e], "tiles": sorted(tiles), "bytes": size, "made": time.strftime("%Y-%m-%d")}
+          with open(ip, "w") as f:
+              json.dump(idx, f, separators=(",", ":"))
+          print("Saved %d roads in %d tiles, %.1f MB" % (len(ways), len(tiles), size / 1e6), flush=True)
+          PY
+      - name: Save to the website
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add roads
+          git commit -m "Road map: ${{ inputs.area }}" || exit 0
+          git pull --rebase
+          git push
